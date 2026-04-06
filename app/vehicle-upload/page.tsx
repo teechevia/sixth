@@ -29,7 +29,13 @@ import {
   Search,
 } from "lucide-react"
 import Image from "next/image"
-import { vehicleScanHistory, type AuthStatus } from "@/lib/fake-data"
+import { 
+  vehicleScanHistory, 
+  type AuthStatus,
+  checkVehicleStatus,
+  getFirstAvailableSlot,
+  assignSlotToVehicle
+} from "@/lib/fake-data"
 
 type ProcessingState = "idle" | "uploading" | "processing" | "complete"
 
@@ -93,11 +99,11 @@ const statusConfig = {
   unauthorized: {
     label: "Unauthorized",
     icon: ShieldAlert,
-    bgColor: "bg-amber-500/15",
-    borderColor: "border-amber-500/40",
-    textColor: "text-amber-400",
-    shadowColor: "shadow-amber-500/20",
-    glowColor: "bg-amber-500/20",
+    bgColor: "bg-red-500/15",
+    borderColor: "border-red-500/40",
+    textColor: "text-red-400",
+    shadowColor: "shadow-red-500/20",
+    glowColor: "bg-red-500/20",
   },
   blacklisted: {
     label: "Blacklisted",
@@ -301,64 +307,86 @@ export default function VehicleUploadPage() {
       const ocrData = await runOCR(uploadedImage)
       setOcrResult(ocrData)
 
-      // Determine the vehicle number to send to API
-      let vehicleNoToSend = ocrData.detectedPlate
+      // Determine the vehicle number
+      let vehicleNo = ocrData.detectedPlate
+      let usedFallback = ocrData.usedFallback
 
-      // If OCR didn't detect a valid plate, we'll let the API generate a fake one
-      if (!vehicleNoToSend) {
+      // If OCR didn't detect a valid plate, generate a random one for demo
+      if (!vehicleNo) {
         setOcrStatus("No plate detected - using fallback...")
+        // Generate a random vehicle number for demo purposes
+        const states = ["KA", "MH", "DL", "TN", "GJ", "RJ", "UP", "WB", "AP", "HR"]
+        const state = states[Math.floor(Math.random() * states.length)]
+        const district = String(Math.floor(Math.random() * 99) + 1).padStart(2, "0")
+        const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+        const series = letters[Math.floor(Math.random() * letters.length)] + letters[Math.floor(Math.random() * letters.length)]
+        const number = String(Math.floor(Math.random() * 9999) + 1).padStart(4, "0")
+        vehicleNo = `${state} ${district} ${series} ${number}`
+        usedFallback = true
+        
+        // Update OCR result with the generated plate
+        setOcrResult({
+          ...ocrData,
+          detectedPlate: vehicleNo,
+          usedFallback: true,
+        })
       }
 
-      // Create FormData and append the image file
-      const formData = new FormData()
-      formData.append("image", selectedFile)
-      formData.append("action", "entry")
-      formData.append("vehicleNo", vehicleNoToSend || "")
-      formData.append("ocrConfidence", String(ocrData.confidence))
-      formData.append("rawOcrText", ocrData.rawText)
-      formData.append("usedFallback", String(ocrData.usedFallback))
+      setOcrStatus("Looking up vehicle in database...")
 
-      // Send to API for vehicle validation and slot assignment
-      const response = await fetch("/api/detect-vehicle", {
-        method: "POST",
-        body: formData,
-      })
+      // Check the vehicle against the database
+      const vehicleInfo = checkVehicleStatus(vehicleNo)
 
-      const result = await response.json()
+      // Determine slot assignment
+      let assignedSlot: string | null = null
+      let zone: string | null = null
+      let message: string
 
-      if (result.success) {
-        // Update OCR result with the final vehicle number if fallback was used
-        if (ocrData.usedFallback) {
-          setOcrResult({
-            ...ocrData,
-            detectedPlate: result.data.vehicleNo,
+      if (vehicleInfo.status === "authorized") {
+        // Check if vehicle already has a slot (from existing parking zones)
+        // For new entries, assign first available slot
+        const availableSlot = getFirstAvailableSlot()
+        if (availableSlot) {
+          // Assign the slot to the vehicle
+          const assigned = assignSlotToVehicle(availableSlot.slot.id, {
+            number: vehicleNo,
+            owner: vehicleInfo.owner,
+            type: vehicleInfo.type,
           })
+          if (assigned) {
+            assignedSlot = availableSlot.slot.id
+            zone = availableSlot.zone
+            message = "Vehicle authorized - Slot assigned"
+          } else {
+            assignedSlot = null
+            message = "Vehicle authorized - No slots available"
+          }
+        } else {
+          message = "Vehicle authorized - Parking lot full"
         }
-
-        setVehicleDetails({
-          vehicleNo: result.data.vehicleNo,
-          owner: result.data.owner,
-          type: result.data.type,
-          status: result.data.status,
-          slot: result.data.slot,
-          zone: result.data.zone,
-          entryTime: new Date().toLocaleTimeString("en-US", {
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: true,
-          }),
-          confidence: result.data.confidence,
-          message: result.data.message,
-        })
-        setProcessingState("complete")
-        setOcrStatus("Complete")
+      } else if (vehicleInfo.status === "blacklisted") {
+        message = "Access denied - Vehicle is blacklisted"
       } else {
-        setFileError({
-          message: result.error || "Failed to process image",
-          type: "upload_failed",
-        })
-        setProcessingState("idle")
+        message = "Access denied - Vehicle not registered in system"
       }
+
+      setVehicleDetails({
+        vehicleNo: vehicleNo,
+        owner: vehicleInfo.owner,
+        type: vehicleInfo.type,
+        status: vehicleInfo.status,
+        slot: assignedSlot,
+        zone: zone || undefined,
+        entryTime: new Date().toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true,
+        }),
+        confidence: ocrData.confidence,
+        message: message,
+      })
+      setProcessingState("complete")
+      setOcrStatus("Complete")
     } catch (error) {
       console.error("Error detecting vehicle:", error)
       setFileError({
@@ -817,11 +845,11 @@ export default function VehicleUploadPage() {
             {/* Vehicle Details Card */}
             <div
               className={`group relative overflow-hidden rounded-[1.75rem] border bg-zinc-900/60 p-8 shadow-2xl backdrop-blur-3xl transition-all duration-500 hover:shadow-lime-500/5 ${
-                vehicleDetails?.status === "blacklisted"
-                  ? "border-red-500/30 hover:border-red-500/40"
-                  : vehicleDetails?.status === "unauthorized"
-                    ? "border-amber-500/30 hover:border-amber-500/40"
-                    : "border-white/10 hover:border-lime-500/20"
+vehicleDetails?.status === "blacklisted"
+  ? "border-red-500/30 hover:border-red-500/40"
+: vehicleDetails?.status === "unauthorized"
+  ? "border-red-500/30 hover:border-red-500/40"
+  : "border-white/10 hover:border-lime-500/20"
               }`}
             >
               {/* Conditional glow based on status */}
@@ -892,9 +920,7 @@ export default function VehicleUploadPage() {
                       <div className={`mt-4 rounded-xl border p-4 ${
                         vehicleDetails.status === "authorized" 
                           ? "border-lime-500/30 bg-lime-500/10 text-lime-400" 
-                          : vehicleDetails.status === "blacklisted"
-                          ? "border-red-500/30 bg-red-500/10 text-red-400"
-                          : "border-amber-500/30 bg-amber-500/10 text-amber-400"
+                          : "border-red-500/30 bg-red-500/10 text-red-400"
                       }`}>
                         <div className="flex items-center gap-2">
                           {vehicleDetails.status === "authorized" ? (
