@@ -171,12 +171,18 @@ export async function POST(request: Request) {
     let action = "entry"
 
     // ========================================================================
-    // HANDLE FORMDATA (Image Upload)
+    // HANDLE FORMDATA (Image Upload with optional client-side OCR results)
     // ========================================================================
     if (contentType.includes("multipart/form-data")) {
       const formData = await request.formData()
       const imageFile = formData.get("image") as File | null
       action = (formData.get("action") as string) || "entry"
+      
+      // Get client-side OCR results if provided
+      const clientVehicleNo = formData.get("vehicleNo") as string | null
+      const clientOcrConfidence = formData.get("ocrConfidence") as string | null
+      const clientRawOcrText = formData.get("rawOcrText") as string | null
+      const clientUsedFallback = formData.get("usedFallback") as string | null
 
       if (!imageFile) {
         return NextResponse.json(
@@ -198,17 +204,29 @@ export async function POST(request: Request) {
       const arrayBuffer = await imageFile.arrayBuffer()
       const imageBuffer = Buffer.from(arrayBuffer)
 
-      // Process image with OCR
-      const ocrResult = await processImageOCR(imageBuffer, imageFile.type)
-      vehicleNo = ocrResult.vehicleNo
-      confidence = ocrResult.confidence
-
-      console.log(`[OCR] Detected plate: ${vehicleNo} (${confidence.toFixed(1)}% confidence)`)
+      // Check if client-side OCR was successful
+      var rawOcrText: string
+      var usedFallback: boolean
       
-      // Store raw OCR text for response (will be populated when real OCR is implemented)
-      // Currently returns placeholder since we're using fake OCR
-      var rawOcrText = `[Server OCR - Image processed: ${imageFile.name}, Size: ${(imageBuffer.length / 1024).toFixed(1)}KB]`
-      var usedFallback = true // Will be false when real OCR successfully detects plate
+      if (clientVehicleNo && clientVehicleNo.trim() !== "") {
+        // Use client-side OCR result
+        vehicleNo = clientVehicleNo.replace(/\s+/g, "").toUpperCase()
+        confidence = clientOcrConfidence ? parseFloat(clientOcrConfidence) : 95
+        rawOcrText = clientRawOcrText || "(Client-side OCR)"
+        usedFallback = false
+        console.log(`[OCR] Using client OCR result: ${vehicleNo} (${confidence.toFixed(1)}% confidence)`)
+      } else {
+        // Client OCR failed - use server-side fake OCR (or real OCR when implemented)
+        console.log(`[OCR] Client OCR failed to detect plate. Running server fallback...`)
+        console.log(`[OCR] Raw OCR text from client: ${clientRawOcrText?.substring(0, 100)}...`)
+        
+        const ocrResult = await processImageOCR(imageBuffer, imageFile.type)
+        vehicleNo = ocrResult.vehicleNo
+        confidence = ocrResult.confidence
+        rawOcrText = clientRawOcrText || `[Server OCR - Image: ${imageFile.name}, Size: ${(imageBuffer.length / 1024).toFixed(1)}KB]`
+        usedFallback = true
+        console.log(`[OCR] Server fallback result: ${vehicleNo} (${confidence.toFixed(1)}% confidence)`)
+      }
     }
     // ========================================================================
     // HANDLE JSON (From client-side OCR or legacy/testing)

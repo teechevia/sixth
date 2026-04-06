@@ -1,6 +1,7 @@
 "use client"
 
-import { useState, useCallback, useRef } from "react"
+import { useState, useCallback, useRef, useEffect } from "react"
+import { createWorker, Worker } from "tesseract.js"
 import { ParkingSidebar } from "@/components/parking-sidebar"
 import {
   Upload,
@@ -35,6 +36,15 @@ type ProcessingState = "idle" | "uploading" | "processing" | "complete"
 // Allowed file types
 const ALLOWED_FILE_TYPES = ["image/jpeg", "image/jpg", "image/png"]
 const ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png"]
+
+// Indian vehicle number plate patterns
+// Format: SS DD SS DDDD or SS DD S DDDD (S=State, D=District, S=Series, D=Number)
+// Examples: UP16AB1234, DL8CAF9021, HR26DK8331, KA05MX7892
+const VEHICLE_PLATE_PATTERNS = [
+  /([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{1,3})\s*(\d{1,4})/gi, // Standard format with possible spaces
+  /([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{1,4})/gi, // No spaces
+  /([A-Z]{2})\s*(\d{2})\s*([A-Z]{2})\s*(\d{4})/gi, // Common 4-part format
+]
 
 interface VehicleDetails {
   vehicleNo: string
@@ -114,6 +124,116 @@ export default function VehicleUploadPage() {
   const [ocrResult, setOcrResult] = useState<OCRResult | null>(null)
   const [ocrProgress, setOcrProgress] = useState<number>(0)
   const [ocrStatus, setOcrStatus] = useState<string>("")
+  const workerRef = useRef<Worker | null>(null)
+
+  // Initialize Tesseract worker
+  useEffect(() => {
+    const initWorker = async () => {
+      const worker = await createWorker("eng", 1, {
+        logger: (m) => {
+          if (m.status === "recognizing text") {
+            setOcrProgress(Math.round(m.progress * 100))
+            setOcrStatus("Recognizing text...")
+          } else if (m.status === "loading tesseract core") {
+            setOcrStatus("Loading OCR engine...")
+          } else if (m.status === "initializing tesseract") {
+            setOcrStatus("Initializing...")
+          } else if (m.status === "loading language traineddata") {
+            setOcrStatus("Loading language data...")
+          }
+        },
+      })
+      workerRef.current = worker
+    }
+    initWorker()
+
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate()
+      }
+    }
+  }, [])
+
+  // Extract vehicle plate from OCR text using regex patterns
+  const extractVehiclePlate = (text: string): string | null => {
+    // Clean the text - remove newlines, extra spaces, and common OCR errors
+    const cleanedText = text
+      .toUpperCase()
+      .replace(/[^A-Z0-9\s]/g, "") // Remove special characters except spaces
+      .replace(/\s+/g, " ") // Normalize spaces
+      .trim()
+
+    // Try each pattern
+    for (const pattern of VEHICLE_PLATE_PATTERNS) {
+      pattern.lastIndex = 0 // Reset regex state
+      const matches = cleanedText.matchAll(pattern)
+
+      for (const match of matches) {
+        if (match) {
+          // Format the plate number: SS DD SS DDDD
+          const state = match[1]
+          const district = match[2].padStart(2, "0")
+          const series = match[3]
+          const number = match[4].padStart(4, "0")
+          return `${state} ${district} ${series} ${number}`
+        }
+      }
+    }
+
+    // If no pattern matched, try to find any alphanumeric sequence that looks like a plate
+    const simplePattern = /[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}/g
+    const simpleMatch = cleanedText.replace(/\s/g, "").match(simplePattern)
+    if (simpleMatch && simpleMatch[0]) {
+      const plate = simpleMatch[0]
+      // Try to format it nicely
+      const formatted = plate.replace(
+        /([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d+)/,
+        "$1 $2 $3 $4"
+      )
+      return formatted
+    }
+
+    return null
+  }
+
+  // Run OCR on the uploaded image
+  const runOCR = async (imageData: string): Promise<OCRResult> => {
+    if (!workerRef.current) {
+      throw new Error("OCR engine not initialized")
+    }
+
+    setOcrStatus("Starting OCR...")
+    setOcrProgress(0)
+
+    try {
+      const result = await workerRef.current.recognize(imageData)
+      const rawText = result.data.text
+      const confidence = result.data.confidence
+
+      // Try to extract vehicle plate from the OCR result
+      const detectedPlate = extractVehiclePlate(rawText)
+
+      if (detectedPlate) {
+        return {
+          rawText,
+          detectedPlate,
+          confidence,
+          usedFallback: false,
+        }
+      }
+
+      // No valid plate detected - will use fallback
+      return {
+        rawText,
+        detectedPlate: null,
+        confidence,
+        usedFallback: true,
+      }
+    } catch (error) {
+      console.error("OCR Error:", error)
+      throw error
+    }
+  }
 
   // Validate file type
   const validateFile = (file: File): boolean => {
@@ -163,7 +283,7 @@ export default function VehicleUploadPage() {
     reader.readAsDataURL(file)
   }
 
-  // Detect vehicle by uploading image to server via FormData
+  // Detect vehicle using Tesseract.js OCR
   const handleDetectVehicle = useCallback(async () => {
     if (!selectedFile || !uploadedImage) return
 
@@ -172,42 +292,48 @@ export default function VehicleUploadPage() {
     setOcrResult(null)
     setOcrProgress(0)
 
+    // Short delay to show uploading state
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    setProcessingState("processing")
+
     try {
+      // Run client-side OCR on the image
+      const ocrData = await runOCR(uploadedImage)
+      setOcrResult(ocrData)
+
+      // Determine the vehicle number to send to API
+      let vehicleNoToSend = ocrData.detectedPlate
+
+      // If OCR didn't detect a valid plate, we'll let the API generate a fake one
+      if (!vehicleNoToSend) {
+        setOcrStatus("No plate detected - using fallback...")
+      }
+
       // Create FormData and append the image file
       const formData = new FormData()
       formData.append("image", selectedFile)
       formData.append("action", "entry")
+      formData.append("vehicleNo", vehicleNoToSend || "")
+      formData.append("ocrConfidence", String(ocrData.confidence))
+      formData.append("rawOcrText", ocrData.rawText)
+      formData.append("usedFallback", String(ocrData.usedFallback))
 
-      // Simulate upload progress
-      setOcrStatus("Uploading image...")
-      setOcrProgress(25)
-      await new Promise((resolve) => setTimeout(resolve, 300))
-
-      setProcessingState("processing")
-      setOcrStatus("Processing image on server...")
-      setOcrProgress(50)
-
-      // Send image to API via FormData
+      // Send to API for vehicle validation and slot assignment
       const response = await fetch("/api/detect-vehicle", {
         method: "POST",
-        body: formData, // No Content-Type header - browser sets it with boundary
+        body: formData,
       })
 
-      setOcrProgress(75)
-      setOcrStatus("Analyzing license plate...")
-      
       const result = await response.json()
-      
-      setOcrProgress(100)
 
       if (result.success) {
-        // Set OCR result from server response
-        setOcrResult({
-          rawText: result.data.rawOcrText || "(Server-side OCR)",
-          detectedPlate: result.data.vehicleNo,
-          confidence: result.data.confidence,
-          usedFallback: result.data.usedFallback || false,
-        })
+        // Update OCR result with the final vehicle number if fallback was used
+        if (ocrData.usedFallback) {
+          setOcrResult({
+            ...ocrData,
+            detectedPlate: result.data.vehicleNo,
+          })
+        }
 
         setVehicleDetails({
           vehicleNo: result.data.vehicleNo,
@@ -229,15 +355,15 @@ export default function VehicleUploadPage() {
       } else {
         setFileError({
           message: result.error || "Failed to process image",
-          type: "upload_failed"
+          type: "upload_failed",
         })
         setProcessingState("idle")
       }
     } catch (error) {
       console.error("Error detecting vehicle:", error)
       setFileError({
-        message: "Failed to upload image. Please try again.",
-        type: "upload_failed"
+        message: "OCR processing failed. Please try again.",
+        type: "ocr_failed",
       })
       setProcessingState("idle")
     }
