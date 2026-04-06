@@ -204,6 +204,11 @@ export async function POST(request: Request) {
       confidence = ocrResult.confidence
 
       console.log(`[OCR] Detected plate: ${vehicleNo} (${confidence.toFixed(1)}% confidence)`)
+      
+      // Store raw OCR text for response (will be populated when real OCR is implemented)
+      // Currently returns placeholder since we're using fake OCR
+      var rawOcrText = `[Server OCR - Image processed: ${imageFile.name}, Size: ${(imageBuffer.length / 1024).toFixed(1)}KB]`
+      var usedFallback = true // Will be false when real OCR successfully detects plate
     }
     // ========================================================================
     // HANDLE JSON (From client-side OCR or legacy/testing)
@@ -357,6 +362,8 @@ export async function POST(request: Request) {
             type: "security",
             message: "Blacklisted vehicle attempted entry",
           },
+          rawOcrText: typeof rawOcrText !== "undefined" ? rawOcrText : null,
+          usedFallback: typeof usedFallback !== "undefined" ? usedFallback : false,
         },
       })
     }
@@ -403,6 +410,8 @@ export async function POST(request: Request) {
             type: "unauthorized",
             message: "Unauthorized vehicle attempted entry",
           },
+          rawOcrText: typeof rawOcrText !== "undefined" ? rawOcrText : null,
+          usedFallback: typeof usedFallback !== "undefined" ? usedFallback : false,
         },
       })
     }
@@ -438,6 +447,8 @@ export async function POST(request: Request) {
             type: "maintenance",
             message: "Parking lot is full",
           },
+          rawOcrText: typeof rawOcrText !== "undefined" ? rawOcrText : null,
+          usedFallback: typeof usedFallback !== "undefined" ? usedFallback : false,
         },
       })
     }
@@ -480,6 +491,9 @@ export async function POST(request: Request) {
             entryTime: entryLog.entryTime,
             gate: entryLog.gate,
           },
+          // OCR metadata for client display
+          rawOcrText: typeof rawOcrText !== "undefined" ? rawOcrText : null,
+          usedFallback: typeof usedFallback !== "undefined" ? usedFallback : false,
         },
       })
     }
